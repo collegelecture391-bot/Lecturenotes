@@ -629,6 +629,38 @@ def fetch_drive_txt(file_id):
     return info["name"], base64.b64decode(info["base64"])
 
 
+def list_drive_pdfs():
+    """강의록 업로드 폴더의 PDF 목록 (최근 수정 순)"""
+    info = drive_call({"action": "pdflist"})
+    return info.get("folderName", ""), info["files"]
+
+
+def fetch_drive_pdf(file_id, progress_bar=None):
+    """강의록 PDF 내려받기. Apps Script 가 내려받을 주소와 임시 토큰을 주면
+    서버가 직접 받는다 (큰 PDF를 base64 로 주고받지 않으려고)"""
+    info = drive_call({"action": "pdfget", "fileId": file_id}, timeout=60)
+    total = int(info.get("size") or 0)
+    with requests.get(info["downloadUrl"],
+                      headers={"Authorization": f"Bearer {info['token']}"},
+                      stream=True, timeout=300) as r:
+        if r.status_code != 200:
+            raise RuntimeError(f"내려받기 실패 ({r.status_code}) {r.text[:200]}")
+        buf = io.BytesIO()
+        for part in r.iter_content(chunk_size=1024 * 1024):
+            buf.write(part)
+            if progress_bar is not None and total:
+                pct = min(int(buf.tell() / total * 100), 100)
+                progress_bar.progress(pct / 100,
+                                      text=f"강의록 받는 중... {pct}% "
+                                           f"({buf.tell() / 1e6:.1f} / {total / 1e6:.1f} MB)")
+    return info["name"], buf.getvalue()
+
+
+def trash_drive_file(file_id):
+    """강의록 업로드 폴더 안의 파일만 휴지통으로 보낸다 (영구 삭제 아님)"""
+    return drive_call({"action": "trash", "fileId": file_id})
+
+
 def list_drive_folders():
     info = drive_call({"action": "list"})
     return info["root"], info["folders"]
@@ -692,7 +724,66 @@ st.set_page_config(page_title="PDF 대본 매칭기", layout="centered")
 st.title("PDF 대본 매칭기")
 
 st.subheader("1. 강의록 PDF")
-uploaded_pdf = st.file_uploader("강의록 PDF", type=["pdf"], label_visibility="collapsed")
+pdf_tab_drive, pdf_tab_file = st.tabs(["드라이브", "PDF 업로드"])
+
+with pdf_tab_drive:
+    if get_drive_config() is None:
+        st.caption("앱 설정(Secrets)에 [drive] 항목이 있어야 사용할 수 있습니다.")
+    else:
+        pc1, pc2 = st.columns([5, 1])
+        with pc1:
+            if "drive_pdf_list" not in st.session_state:
+                try:
+                    with st.spinner("강의록 목록 불러오는 중..."):
+                        st.session_state["drive_pdf_list"] = list_drive_pdfs()
+                except Exception as e:
+                    st.error(f"강의록 목록을 불러오지 못했습니다: {e}")
+        with pc2:
+            st.write("")
+            st.write("")
+            if st.button("새로고침", key="pdf_refresh", use_container_width=True):
+                st.session_state.pop("drive_pdf_list", None)
+                st.rerun()
+
+        if "drive_pdf_list" in st.session_state:
+            pdf_folder_name, pdf_files = st.session_state["drive_pdf_list"]
+            if not pdf_files:
+                st.info(f"'{pdf_folder_name}' 폴더에 PDF 파일이 없습니다.")
+            else:
+                popts = ["(사용 안 함)"] + [
+                    f"{f['name']}  ·  {f['updated']}  ·  {int(f.get('size', 0)) / 1e6:.1f}MB"
+                    for f in pdf_files]
+                ppick = st.selectbox(f"{pdf_folder_name} 폴더 (최근 수정 순)", popts,
+                                     key="drive_pdf_pick")
+                if ppick != "(사용 안 함)":
+                    pchosen = pdf_files[popts.index(ppick) - 1]
+                    if st.session_state.get("drive_pdf_id") != pchosen["id"]:
+                        pbar = st.progress(0, text="강의록 받는 중... 0%")
+                        try:
+                            name, raw = fetch_drive_pdf(pchosen["id"], pbar)
+                            st.session_state["drive_pdf_id"] = pchosen["id"]
+                            st.session_state["drive_pdf_data"] = (name, raw)
+                        except Exception as e:
+                            st.error(f"강의록을 불러오지 못했습니다: {e}")
+                        pbar.empty()
+                else:
+                    st.session_state.pop("drive_pdf_id", None)
+                    st.session_state.pop("drive_pdf_data", None)
+
+        if "drive_pdf_data" in st.session_state:
+            name, raw = st.session_state["drive_pdf_data"]
+            st.success(f"{name} · {len(raw) / 1e6:.1f}MB")
+
+with pdf_tab_file:
+    uploaded_pdf = st.file_uploader("강의록 PDF", type=["pdf"], label_visibility="collapsed")
+
+# 강의록 출처 정하기: 드라이브에서 고른 것이 있으면 그것을, 없으면 직접 올린 파일을 쓴다
+src_pdf_name, src_pdf_bytes, src_drive_id = None, None, None
+if "drive_pdf_data" in st.session_state:
+    src_pdf_name, src_pdf_bytes = st.session_state["drive_pdf_data"]
+    src_drive_id = st.session_state.get("drive_pdf_id")
+elif uploaded_pdf is not None:
+    src_pdf_name, src_pdf_bytes = uploaded_pdf.name, uploaded_pdf.getvalue()
 
 st.subheader("2. 대본")
 tab_drive, tab_file, tab_paste = st.tabs(["드라이브", "TXT 업로드", "붙여넣기"])
@@ -760,9 +851,9 @@ with col1:
 with col2:
     font_size = st.slider("대본 글자 크기 (pt)", 6.0, 16.0, 11.0, 0.5)
 
-if uploaded_pdf is not None:
-    if st.session_state.get("src_name") != uploaded_pdf.name:
-        st.session_state["src_name"] = uploaded_pdf.name
+if src_pdf_bytes is not None:
+    if st.session_state.get("src_name") != src_pdf_name:
+        st.session_state["src_name"] = src_pdf_name
         st.session_state.pop("output_bytes", None)
 
     if st.button("변환 실행", type="primary", use_container_width=True):
@@ -780,7 +871,7 @@ if uploaded_pdf is not None:
             st.session_state.pop("output_bytes", None)
             st.session_state["run_id"] = st.session_state.get("run_id", 0) + 1
             st.session_state["output_bytes"] = process_pdf_with_script(
-                uploaded_pdf.getvalue(), script_dict, progress_bar, status_text,
+                src_pdf_bytes, script_dict, progress_bar, status_text,
                 margin_cm, font_size, margin_side)
             status_text.success("변환 완료")
         except Exception as e:
@@ -788,7 +879,7 @@ if uploaded_pdf is not None:
 
     if "output_bytes" in st.session_state:
         st.subheader("4. 저장")
-        default_name = f"대본추가_{os.path.splitext(uploaded_pdf.name)[0]}.pdf"
+        default_name = f"대본추가_{os.path.splitext(src_pdf_name)[0]}.pdf"
         out_name = st.text_input("파일 이름", value=default_name,
                                  key=f"out_name_{st.session_state.get('run_id', 0)}").strip()
         out_name = re.sub(r'[\\/:*?"<>|]', "_", out_name) or "대본추가"
@@ -843,6 +934,12 @@ if uploaded_pdf is not None:
                         except Exception as e:
                             st.error(f"폴더를 만들지 못했습니다: {e}")
 
+                trash_after = False
+                if src_drive_id:
+                    trash_after = st.checkbox(
+                        "업로드가 끝나면 강의록 원본을 휴지통으로 보내기 (30일 안에 복구 가능)",
+                        value=True, key="trash_after_upload")
+
                 up_key = f"drive_link_{st.session_state.get('run_id', 0)}_{folder_id}_{out_name}"
                 if st.button(f"{labels[folder_id]}에 업로드", use_container_width=True):
                     up_bar = st.progress(0, text="업로드 준비 중... 0%")
@@ -851,6 +948,19 @@ if uploaded_pdf is not None:
                             st.session_state["output_bytes"], out_name, up_bar, folder_id)
                     except Exception as e:
                         st.error(f"업로드 실패: {e}")
+                    # 업로드가 성공했을 때만 원본을 휴지통으로
+                    if up_key in st.session_state and trash_after and src_drive_id:
+                        try:
+                            if st.session_state.get("trashed_id") != src_drive_id:
+                                trash_drive_file(src_drive_id)
+                                st.session_state["trashed_id"] = src_drive_id
+                            st.session_state["trashed_name"] = src_pdf_name
+                            # 목록은 다음 '새로고침' 때 갱신 (지금 지우면 결과 화면이 사라짐)
+                        except Exception as e:
+                            st.error(f"원본 강의록을 휴지통으로 보내지 못했습니다: {e}")
                 if up_key in st.session_state:
                     link, folder_name = st.session_state[up_key]
                     st.success(f"{folder_name} 폴더에 저장됨 · [드라이브에서 열기]({link})")
+                    if src_drive_id and st.session_state.get("trashed_id") == src_drive_id:
+                        st.info(f"원본 강의록 '{st.session_state['trashed_name']}'을 "
+                                f"휴지통으로 보냈습니다.")
