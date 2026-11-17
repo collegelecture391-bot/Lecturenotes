@@ -657,7 +657,7 @@ def fetch_drive_pdf(file_id, progress_bar=None):
 
 
 def trash_drive_file(file_id):
-    """강의록 업로드 폴더 안의 파일만 휴지통으로 보낸다 (영구 삭제 아님)"""
+    """강의록 업로드 폴더 안의 파일만 정리한다: 내 파일은 휴지통, 남의 파일은 폴더에서 빼기 (영구 삭제 아님)"""
     return drive_call({"action": "trash", "fileId": file_id})
 
 
@@ -952,7 +952,8 @@ if src_pdf_bytes is not None:
                     if up_key in st.session_state and trash_after and src_drive_id:
                         try:
                             if st.session_state.get("trashed_id") != src_drive_id:
-                                trash_drive_file(src_drive_id)
+                                res = trash_drive_file(src_drive_id)
+                                st.session_state["trashed_result"] = res.get("result")
                                 st.session_state["trashed_id"] = src_drive_id
                             st.session_state["trashed_name"] = src_pdf_name
                             # 목록은 다음 '새로고침' 때 갱신 (지금 지우면 결과 화면이 사라짐)
@@ -962,5 +963,11 @@ if src_pdf_bytes is not None:
                     link, folder_name = st.session_state[up_key]
                     st.success(f"{folder_name} 폴더에 저장됨 · [드라이브에서 열기]({link})")
                     if src_drive_id and st.session_state.get("trashed_id") == src_drive_id:
-                        st.info(f"원본 강의록 '{st.session_state['trashed_name']}'을 "
-                                f"휴지통으로 보냈습니다.")
+                        how = st.session_state.get("trashed_result")
+                        if how == "trashed":
+                            st.info(f"원본 강의록 '{st.session_state['trashed_name']}'을 "
+                                    f"휴지통으로 보냈습니다. (30일 안에 복구 가능)")
+                        else:
+                            st.info(f"원본 강의록 '{st.session_state['trashed_name']}'을 "
+                                    f"강의록 폴더에서 뺐습니다. (다른 계정 파일이라 휴지통 대신, "
+                                    f"올린 사람 드라이브에는 남아 있음)")
